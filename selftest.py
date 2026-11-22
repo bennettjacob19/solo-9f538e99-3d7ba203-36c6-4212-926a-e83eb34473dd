@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Headless self-test of the deliverable.
 
-Starts the real app, drives a sample build, and exercises the two behaviours
+Starts the real app, drives a sample build, and exercises the behaviours
 that are hard to get right:
 
   1. 掉线续看: a viewer disconnects mid-build, the build keeps producing with
@@ -9,8 +9,16 @@ that are hard to get right:
      see every remaining line exactly once, in order.
   2. 缓冲溢出: a viewer falls more than one buffer behind, and must be told the
      exact missing line range, then continue from the oldest retained line.
+  3. 慢连接: a stalled SSE reader must not slow down log collection.
+  4. 失败用例重跑: a failed case is rerun against the original artifacts and
+     the verdict flips only after the batch completes; the initial failure
+     record is kept.
+  5. 交错: during a rerun, a new build with the other config completes; the
+     rerun still uses the original artifacts and lands only on its own report.
+  6. 重跑中断: cancelling a rerun mid-flight marks it interrupted and keeps
+     the previous verdict.
 
-Exit code 0 means both scenarios behaved as specified.
+Exit code 0 means every scenario behaved as specified.
 """
 
 from __future__ import annotations
@@ -18,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -195,11 +204,169 @@ async def scenario_slow_viewer() -> None:
         await stop()
 
 
+# ---- reports & reruns -------------------------------------------------------
+
+FAST_ENV = {
+    "SAMPLE_BUILD_STEPS": "3",
+    "SAMPLE_BUILD_DELAY": "0.02",
+    "SAMPLE_TEST_DELAY": "0.05",
+}
+
+
+async def start_sample_server(env: dict[str, str]):
+    """Server running the real sample build with a throwaway artifacts dir."""
+    saved = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    artifacts = tempfile.mkdtemp(prefix="buildlog-artifacts-")
+    runner = BuildRunner(capacity=200, artifacts_dir=artifacts)
+    app = create_app(runner)
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", lifespan="on")
+    )
+    task = asyncio.create_task(server.serve())
+    await wait_for(lambda: server.started, timeout=10)
+    port = server.servers[0].sockets[0].getsockname()[1]
+
+    async def stop():
+        await runner.shutdown()
+        server.should_exit = True
+        try:
+            await asyncio.wait_for(task, timeout=10)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            task.cancel()
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    return runner, f"http://127.0.0.1:{port}", stop
+
+
+async def wait_report(base: str, build_id: int, pred, timeout: float = 30.0) -> dict:
+    """Poll a report until pred(payload) holds; return the payload."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    last = None
+    async with httpx.AsyncClient() as http:
+        while True:
+            res = await http.get(f"{base}/api/reports/{build_id}")
+            if res.status_code == 200:
+                last = res.json()
+                if pred(last):
+                    return last
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError(f"report {build_id} stuck: {last}")
+            await asyncio.sleep(0.05)
+
+
+def case_of(report: dict, name: str) -> dict:
+    return next(c for c in report["cases"] if c["name"] == name)
+
+
+async def scenario_rerun() -> None:
+    print("\n[4] 失败用例重跑 (failed case → rerun → verdict flips, initial kept)")
+    runner, base, stop = await start_sample_server(FAST_ENV)
+    try:
+        async with httpx.AsyncClient() as http:
+            res = await http.post(f"{base}/api/build/start", json={"config": "debug"})
+            check(res.status_code == 202, "debug build started")
+
+        report = await wait_report(base, 1, lambda r: True)
+        check(report["verdict"] == "failed", f"initial verdict failed (got {report['verdict']})")
+        flaky = case_of(report, "test_flaky_cache")
+        check(flaky["initial"]["status"] == "fail", "flaky case failed in the initial run")
+        check(report["counts"]["failed"] == 1, "exactly one failing case in the report")
+
+        async with httpx.AsyncClient() as http:
+            res = await http.post(f"{base}/api/reports/1/rerun")
+            check(res.status_code == 202, "rerun accepted")
+            batch = res.json()["active_rerun"]["cases"]
+            check(batch == ["test_flaky_cache"], f"only the failing case is rerun ({batch})")
+
+        report = await wait_report(base, 1, lambda r: r["verdict"] == "passed")
+        flaky = case_of(report, "test_flaky_cache")
+        check(flaky["current"]["status"] == "pass", "flaky case passed after rerun")
+        check(flaky["current"]["source"] == "rerun#1", "current result is attributed to the rerun")
+        check(flaky["initial"]["status"] == "fail", "initial failure record is kept")
+        check(report["reruns"][0]["status"] == "completed", "rerun marked completed")
+    finally:
+        await stop()
+
+
+async def scenario_interleave() -> None:
+    print("\n[5] 交错 (rerun in flight + new build with the other config)")
+    runner, base, stop = await start_sample_server(FAST_ENV)
+    try:
+        async with httpx.AsyncClient() as http:
+            await http.post(f"{base}/api/build/start", json={"config": "debug"})
+        await wait_report(base, 1, lambda r: True)
+
+        # Slow the rerun down, then switch config and finish a whole new build
+        # while the rerun is still running.
+        os.environ["SAMPLE_TEST_DELAY"] = "1.0"
+        async with httpx.AsyncClient() as http:
+            res = await http.post(f"{base}/api/reports/1/rerun")
+            check(res.status_code == 202, "rerun of build #1 started")
+        os.environ["SAMPLE_TEST_DELAY"] = "0.05"
+        async with httpx.AsyncClient() as http:
+            res = await http.post(f"{base}/api/build/start", json={"config": "release"})
+            check(res.status_code == 202, "release build started while rerun in flight")
+
+        report2 = await wait_report(base, 2, lambda r: True)
+        check(report2["config"] == "release", "second report belongs to the release build")
+        report1 = await wait_report(base, 1, lambda r: r["verdict"] == "passed")
+
+        flaky1 = case_of(report1, "test_flaky_cache")
+        check(
+            flaky1["current"]["source"] == "rerun#1" and flaky1["current"]["status"] == "pass",
+            "rerun committed to the original report only",
+        )
+        flaky2 = case_of(report2, "test_flaky_cache")
+        check(
+            flaky2["current"]["status"] == "fail" and flaky2["current"]["source"] == "initial",
+            "the new build's report was not touched by the rerun",
+        )
+        check(report2["verdict"] == "failed", "release build keeps its own failed verdict")
+    finally:
+        await stop()
+
+
+async def scenario_rerun_interrupted() -> None:
+    print("\n[6] 重跑中断 (cancel mid-rerun → interrupted, verdict kept)")
+    runner, base, stop = await start_sample_server(FAST_ENV)
+    try:
+        async with httpx.AsyncClient() as http:
+            await http.post(f"{base}/api/build/start", json={"config": "debug"})
+        await wait_report(base, 1, lambda r: True)
+
+        os.environ["SAMPLE_TEST_DELAY"] = "3.0"  # slow enough to cancel mid-case
+        async with httpx.AsyncClient() as http:
+            await http.post(f"{base}/api/reports/1/rerun")
+        await wait_report(base, 1, lambda r: r["active_rerun"] is not None)
+        async with httpx.AsyncClient() as http:
+            res = await http.post(f"{base}/api/reports/1/rerun/cancel")
+            check(res.json()["cancelled"] is True, "rerun cancelled")
+
+        report = await wait_report(base, 1, lambda r: r["reruns"][-1]["status"] == "interrupted")
+        check(report["reruns"][-1]["status"] == "interrupted", "rerun marked interrupted")
+        check(report["verdict"] == "failed", "previous verdict kept after interruption")
+        flaky = case_of(report, "test_flaky_cache")
+        check(
+            flaky["current"]["status"] == "fail" and flaky["initial"]["status"] == "fail",
+            "no partial results were committed",
+        )
+    finally:
+        await stop()
+
+
 async def main() -> int:
     print("self-test: build log viewer")
     await scenario_resume()
     await scenario_overflow()
     await scenario_slow_viewer()
+    await scenario_rerun()
+    await scenario_interleave()
+    await scenario_rerun_interrupted()
     print()
     if failures:
         print(f"RESULT: {len(failures)} check(s) failed")

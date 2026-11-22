@@ -8,6 +8,9 @@ services:
     environment:
       # Server-side ring size. Spec requirement is the most recent 200 lines.
       BUILDLOG_CAPACITY: "200"
+      # Where build artifacts (app.bin, test results, rerun results) are written.
+      # Mount a volume here if they should survive container replacement.
+      BUILDLOG_ARTIFACTS_DIR: "/srv/artifacts"
     restart: unless-stopped
     init: true
     stop_grace_period: 15s

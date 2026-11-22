@@ -5,3 +5,4 @@ __pycache__
 .pytest_cache
 tests
 tests/js/node_modules
+artifacts

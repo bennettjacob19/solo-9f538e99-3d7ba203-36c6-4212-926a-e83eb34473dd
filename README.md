@@ -2,12 +2,25 @@
 
 本地样例构建的实时日志页：FastAPI 后端 + 原生 JS 前端 + SSE。
 可以启动/停止一次本地样例构建，边跑边看标准输出与错误输出，每行带行号。
+构建有两种配置（debug / release）可选；构建会生成对应产物并实际运行一组本地测试，
+页面按构建号展示各用例结果，失败用例可以单独重跑。
 
 ## 关键行为
 
 | 需求 | 实现 |
 | --- | --- |
 | 网页启动本地样例构建 | `POST /api/build/start` 用 `asyncio.create_subprocess_exec` 跑 `app/sample_build.py`（约 15 秒，stdout 进度 + stderr 警告） |
+| 网页可选两种配置 | 页面下拉选择 debug / release，随 `POST /api/build/start` 的 JSON body 提交；`app/sample_build.py --config` 生成对应产物（debug 含调试符号，release 剥离） |
+| 样例构建生成产物并实际运行本地测试 | 构建先写 `<产物目录>/build-<号>/`（app.bin + sha256 + meta.json），再以子进程跑 `app/sample_tests.py` 的 5 个用例，结果写 `test-results.json`；构建退出码即测试退出码 |
+| 页面按构建号显示各用例结果 | 构建结束后服务端把 `test-results.json` 转成报告，`GET /api/reports` 按构建号列出每个用例的初测/当前结果与判定 |
+| 只重跑当前失败的用例 | `POST /api/reports/{id}/rerun` 收集当前仍失败的用例，只对这批用例再跑一遍测试程序 |
+| 同一报告同时只能重跑一次 | 每个报告一把重跑锁，进行中再请求返回 409（不同报告、以及新构建，都不受影响） |
+| 重跑期间可换配置完成新构建 | 重跑与构建是各自独立的子进程；重跑锁定的是原构建的产物目录与配置，新构建写自己的 `build-<新号>/` 目录 |
+| 重跑仍用原产物，结果只记回原报告 | 重跑命令固定使用报告里保存的 `--artifact-dir` 与 `--config`；提交只改该报告的 `effective` 结果，别的报告不动 |
+| 结果齐了才一起更新判定 | 重跑结果文件带 `finished_at` 完成标记；只有整批用例都有结果且运行正常结束（exit 0/1）才一次性提交并重算判定 |
+| 重跑提前退出保留此前判定 | 取消/崩溃/结果文件不完整 → 该次重跑标记 `interrupted`，判定与当前结果不变，页面显示「重跑中断，已保留此前判定」 |
+| 报告保留初测失败记录 | 报告的 `initial` 结果生成后永不修改；页面「初测」列始终显示首次结果，「当前」列标注来源（initial / 重跑#N） |
+| 样例可演示重跑后通过 | `test_flaky_cache` 用例冷缓存首跑必败、重跑通过；release 配置的 `test_debug_symbols` 则是重跑修不好的真实失败，用于对照 |
 | 实时看到 stdout/stderr 与行号 | 两个 pump 任务逐行解码（UTF-8 增量解码、支持 `\n` / `\r\n` / `\r`、无换行的尾行也会落盘），SSE 按行号推送 |
 | 无人观看时也继续采集 | 采集与查看完全解耦：pump 只写共享环形缓冲，从不等待客户端；没有订阅者时照常写入 |
 | 服务端只保留最近 200 行 | `LogBuffer(capacity=200)`（`BUILDLOG_CAPACITY` 可调），行号全局单调递增、永不复用 |
@@ -46,9 +59,13 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/` | 日志页 |
-| POST | `/api/build/start` | 启动样例构建；已在运行时返回 409 |
+| POST | `/api/build/start` | 启动样例构建；body 可带 `{"config": "debug"\|"release"}`（默认 debug）；已在运行时返回 409，未知配置返回 400 |
 | POST | `/api/build/cancel` | 停止当前构建（子进程被 kill） |
-| GET | `/api/status` | 状态、行号范围、缓冲占用、session_id |
+| GET | `/api/status` | 状态、当前配置、行号范围、缓冲占用、session_id |
+| GET | `/api/reports` | 全部测试报告（按构建号；含各用例初测/当前结果、判定、重跑状态） |
+| GET | `/api/reports/{id}` | 单个报告；不存在返回 404 |
+| POST | `/api/reports/{id}/rerun` | 重跑该报告当前失败的用例；进行中返回 409，无失败用例返回 400 |
+| POST | `/api/reports/{id}/rerun/cancel` | 中断进行中的重跑（标记 interrupted，保留此前判定） |
 | GET | `/api/logs/stream?after=N` | SSE：`hello` / `lines` / `gap` / `status` / `end`，SSE `id` 为行号 |
 | GET | `/api/logs/tail?after=N&limit=K` | 一次性读取，便于脚本或测试 |
 | GET | `/healthz` | 健康检查（容器 HEALTHCHECK 使用） |
@@ -58,7 +75,10 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## 页面操作
 
+* **配置下拉框**：选择 debug 或 release，下一次构建生效（重跑进行中也随时可以改）
 * **启动样例构建 / 停止**
+* **测试报告区**：按构建号列出每次构建的判定与通过数；点「详情」展开各用例的初测/当前结果
+* **重跑失败用例**：只重跑该报告当前失败的用例；进行中显示进度与「中断重跑」
 * **模拟断线**：主动关闭 EventSource；构建继续采集
 * **重连**：从最后显示的行号之后续读
 * 网络异常时自动重连（0.5s 起指数退避，上限 8s），依旧从最后显示的行开始
@@ -68,21 +88,25 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-python3 -m pytest tests/ -q      # 后端 23 项：缓冲语义 + 真 uvicorn 上的 SSE 端到端
-python3 selftest.py              # 交付自测：断线续看 / 缓冲溢出 / 慢连接，逐项打印 ok
-(cd tests/js && npm install && npm test)   # 前端 11 项（jsdom 驱动真实 app.js）
+python3 -m pytest tests/ -q      # 后端 36 项：缓冲语义 + SSE 端到端 + 报告/重跑
+python3 selftest.py              # 交付自测：断线续看 / 缓冲溢出 / 慢连接 / 重跑 / 交错 / 中断
+(cd tests/js && npm install && npm test)   # 前端 16 项（jsdom 驱动真实 app.js）
 ```
 
 `tests/` 覆盖：行号单调、gap 精确区间、断开期间继续采集、重连首行、补读与实时行拼接无重无漏、
 慢读者收到 gap 后从最早保留行继续、卡住的连接不影响构建时长与第二个窗口、
-并发两个窗口内容一致、409 冲突、取消、失败退出码、无换行尾行、非法游标、重启后旧游标。
+并发两个窗口内容一致、409 冲突、取消、失败退出码、无换行尾行、非法游标、重启后旧游标；
+以及报告与重跑：构建出报告、只重跑失败用例、判定翻转且初测记录保留、release 真实失败重跑修不好、
+重跑冲突 409、重跑与新构建交错互不污染、取消/崩溃的重跑标记中断并保留判定、提交规则的单元测试。
 
 ## 文件
 
 ```
-app/main.py        FastAPI 应用工厂：路由、SSE 循环、游标/epoch 处理
-app/buildlog.py    LogBuffer（200 行环形 + 行号 + gap）与 BuildRunner（子进程采集）
-app/sample_build.py 样例构建
+app/main.py        FastAPI 应用工厂：路由、SSE 循环、游标/epoch 处理、报告与重跑接口
+app/buildlog.py    LogBuffer（200 行环形 + 行号 + gap）与 BuildRunner（子进程采集、报告挂钩）
+app/reports.py     ReportManager：报告、失败用例重跑、整批提交/中断语义
+app/sample_build.py 样例构建：按配置生成产物并运行本地测试
+app/sample_tests.py 样例测试程序：5 个用例，结果文件增量落盘（含确定的 flaky 用例）
 app/static/        index.html / style.css / app.js
 tests/             后端测试、jsdom 前端测试、合成构建脚本
 selftest.py        交付自测脚本
@@ -91,9 +115,15 @@ Dockerfile / docker-compose.yml
 
 ## 已知边界
 
-* **单实例、单机**：状态在进程内存里。多副本部署时各副本有各自的缓冲与构建；没有跨进程共享。
+* **单实例、单机**：构建状态与测试报告都在进程内存里。多副本部署时各副本有各自的缓冲、构建与报告；
   页面通过 `epoch` 感知「换了进程」，但不会跟随到别的副本。
-* **服务重启后历史日志不保留**（需求只要求最近 200 行，未要求持久化）；正在跑的构建随进程结束。
+* **服务重启后历史日志与报告不保留**（需求只要求最近 200 行日志，未要求持久化）；
+  正在跑的构建与重跑随进程结束（重跑按中断处理）。产物文件仍留在磁盘上，但对应的报告已消失，
+  不会被重新加载。
+* **产物目录只增不减**：每次构建写 `artifacts/build-<号>/`（可用 `BUILDLOG_ARTIFACTS_DIR` 改位置），
+  没有自动清理；长期运行需要自行定期清理或挂卷。
 * 只支持一个构建同时运行；第二个启动请求返回 409（页面按钮在运行时也会禁用）。
+  重跑与构建互不阻塞，不同报告的重跑也可并行；只有「同一报告的重跑」被限制为一次一个。
+* 构建被取消时不生成报告（测试阶段未完整结束）；测试程序自身崩溃的构建同样没有报告。
 * 页面本身没有鉴权；默认只适合本机/内网使用。若对外暴露，应在前面加认证与 TLS。
 * 构建完成后 SSE 连接保持打开以便继续接收下一次构建；只有服务关闭时才发 `end` 并断开。

@@ -9,6 +9,7 @@
     log: document.getElementById("log"),
     start: document.getElementById("start"),
     cancel: document.getElementById("cancel"),
+    config: document.getElementById("config"),
     disconnect: document.getElementById("disconnect"),
     reconnect: document.getElementById("reconnect"),
     follow: document.getElementById("follow"),
@@ -20,6 +21,7 @@
     capacity: document.getElementById("capacity"),
     gapCount: document.getElementById("gap-count"),
     jumpBottom: document.getElementById("jump-bottom"),
+    reportsList: document.getElementById("reports-list"),
   };
 
   const state = {
@@ -35,6 +37,11 @@
     gaps: 0,
     missingTotal: 0,
     capacity: 200,
+  };
+
+  const reportsState = {
+    list: [],               // full report payloads from /api/reports
+    selected: null,         // build_id whose case table is expanded
   };
 
   const nearBottom = () =>
@@ -152,6 +159,7 @@
     if (payload) {
       if (payload.run_id) el.runId.textContent = `#${payload.run_id}`;
       const bits = [];
+      if (payload.config) bits.push(`配置 ${payload.config}`);
       if (payload.capacity) {
         state.capacity = payload.capacity;
         el.capacity.textContent = payload.capacity;
@@ -268,21 +276,26 @@
     };
   }
 
-  async function postJSON(url) {
-    const res = await fetch(url, { method: "POST" });
-    let body = null;
-    try { body = await res.json(); } catch (_) { /* ignore */ }
+  async function postJSON(url, body) {
+    const opts = { method: "POST" };
+    if (body !== undefined) {
+      opts.headers = { "Content-Type": "application/json" };
+      opts.body = JSON.stringify(body);
+    }
+    const res = await fetch(url, opts);
+    let payload = null;
+    try { payload = await res.json(); } catch (_) { /* ignore */ }
     if (!res.ok) {
-      const msg = body && body.detail ? (typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail)) : res.statusText;
+      const msg = payload && payload.detail ? (typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail)) : res.statusText;
       throw new Error(msg);
     }
-    return body;
+    return payload;
   }
 
   el.start.addEventListener("click", async () => {
     el.start.disabled = true;
     try {
-      const body = await postJSON("/api/build/start");
+      const body = await postJSON("/api/build/start", { config: el.config.value });
       setStatus(body.status, body);
       if (!state.connected) connect();
     } catch (err) {
@@ -325,10 +338,189 @@
     scrollToBottom();
   });
 
+  /* ---------- test reports & failed-case reruns ---------- */
+
+  function casePill(status) {
+    const span = document.createElement("span");
+    span.className = status === "pass" ? "case-pass" : "case-fail";
+    span.textContent = status;
+    return span;
+  }
+
+  function renderCaseTable(report) {
+    const table = document.createElement("table");
+    table.className = "cases";
+    const head = document.createElement("thead");
+    head.innerHTML = "<tr><th>用例</th><th>初测</th><th>当前</th><th>说明</th></tr>";
+    table.appendChild(head);
+    const tbody = document.createElement("tbody");
+    for (const c of report.cases || []) {
+      const tr = document.createElement("tr");
+      const name = document.createElement("td");
+      name.textContent = c.name;
+      const initial = document.createElement("td");
+      initial.appendChild(casePill(c.initial.status));
+      initial.title = c.initial.detail || "";
+      const current = document.createElement("td");
+      current.appendChild(casePill(c.current.status));
+      if (c.current.source && c.current.source !== "initial") {
+        const tag = document.createElement("span");
+        tag.className = "src-tag";
+        tag.textContent = c.current.source.replace("rerun#", "重跑#");
+        current.appendChild(tag);
+      }
+      const detail = document.createElement("td");
+      detail.className = "muted";
+      detail.textContent = c.current.detail || "";
+      tr.append(name, initial, current, detail);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    return table;
+  }
+
+  function renderRerunHistory(report) {
+    const box = document.createElement("div");
+    box.className = "rerun-history muted";
+    const reruns = report.reruns || [];
+    if (!reruns.length) {
+      box.textContent = "尚无重跑。";
+      return box;
+    }
+    const label = { completed: "已完成", running: "进行中", interrupted: "中断" };
+    box.textContent =
+      "重跑历史：" +
+      reruns
+        .map((r) => `#${r.id} ${label[r.status] || r.status}（${r.cases.length} 个用例）`)
+        .join("；");
+    return box;
+  }
+
+  function renderReport(report) {
+    const card = document.createElement("div");
+    card.className = "report";
+    card.dataset.build = report.build_id;
+
+    const head = document.createElement("div");
+    head.className = "report-head";
+
+    const title = document.createElement("span");
+    title.className = "report-title";
+    title.textContent = `构建 #${report.build_id}`;
+
+    const cfg = document.createElement("span");
+    cfg.className = "pill cfg";
+    cfg.textContent = report.config;
+
+    const verdict = document.createElement("span");
+    verdict.className = "pill " + (report.verdict === "passed" ? "passed" : "failed");
+    verdict.textContent = report.verdict;
+
+    const counts = document.createElement("span");
+    counts.className = "muted";
+    counts.textContent = `通过 ${report.counts.passed}/${report.counts.total}`;
+
+    head.append(title, cfg, verdict, counts);
+
+    const active = report.active_rerun;
+    const failedCount = report.counts.failed;
+    const lastRerun = (report.reruns || [])[report.reruns.length - 1];
+
+    if (active) {
+      const progress = document.createElement("span");
+      progress.className = "rerun-state";
+      progress.textContent = `重跑 #${active.id} 进行中 ${active.completed.length}/${active.cases.length}`;
+      head.appendChild(progress);
+      const cancelBtn = document.createElement("button");
+      cancelBtn.className = "rerun-cancel";
+      cancelBtn.textContent = "中断重跑";
+      head.appendChild(cancelBtn);
+    } else if (lastRerun && lastRerun.status === "interrupted") {
+      const notice = document.createElement("span");
+      notice.className = "rerun-notice";
+      notice.textContent = `⚠ 重跑 #${lastRerun.id} 中断：结果未齐，已保留此前判定`;
+      head.appendChild(notice);
+    }
+
+    const rerunBtn = document.createElement("button");
+    rerunBtn.className = "rerun-start";
+    rerunBtn.textContent = failedCount ? `重跑失败用例 (${failedCount})` : "重跑失败用例";
+    rerunBtn.disabled = !!active || failedCount === 0;
+    head.appendChild(rerunBtn);
+
+    const toggle = document.createElement("button");
+    toggle.className = "report-toggle";
+    const expanded = reportsState.selected === report.build_id;
+    toggle.textContent = expanded ? "收起" : "详情";
+    head.appendChild(toggle);
+
+    card.appendChild(head);
+    if (expanded) {
+      const body = document.createElement("div");
+      body.className = "report-body";
+      body.appendChild(renderCaseTable(report));
+      body.appendChild(renderRerunHistory(report));
+      card.appendChild(body);
+    }
+    return card;
+  }
+
+  function renderReports() {
+    el.reportsList.replaceChildren();
+    if (!reportsState.list.length) {
+      const ph = document.createElement("div");
+      ph.className = "placeholder";
+      ph.textContent = "尚无测试报告。完成一次构建后在此查看各用例结果。";
+      el.reportsList.appendChild(ph);
+      return;
+    }
+    for (const report of reportsState.list) {
+      el.reportsList.appendChild(renderReport(report));
+    }
+  }
+
+  async function loadReports() {
+    try {
+      const res = await fetch("/api/reports", { cache: "no-store" });
+      if (!res.ok) return;
+      const body = await res.json();
+      reportsState.list = Array.isArray(body && body.reports) ? body.reports : [];
+      renderReports();
+    } catch (_) { /* offline; next poll retries */ }
+  }
+
+  el.reportsList.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest("button");
+    const card = ev.target.closest(".report");
+    if (!btn || !card) return;
+    const buildId = Number(card.dataset.build);
+    if (btn.classList.contains("report-toggle")) {
+      reportsState.selected = reportsState.selected === buildId ? null : buildId;
+      renderReports();
+      return;
+    }
+    btn.disabled = true;
+    try {
+      if (btn.classList.contains("rerun-start")) {
+        await postJSON(`/api/reports/${buildId}/rerun`);
+      } else if (btn.classList.contains("rerun-cancel")) {
+        await postJSON(`/api/reports/${buildId}/rerun/cancel`);
+      }
+    } catch (err) {
+      alert("操作失败：" + err.message);
+    } finally {
+      loadReports();
+    }
+  });
+
   window.addEventListener("beforeunload", () => closeStream());
 
   // Initial paint: connect and pick up whatever the server still retains.
   connect();
+  loadReports();
+
+  // Reports change when a build finishes or a rerun commits/interrupts.
+  setInterval(loadReports, 2000);
 
   // Periodically refresh status so a build started in another window shows up.
   setInterval(async () => {

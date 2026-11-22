@@ -73,15 +73,17 @@ function makeLine(seq, text = `line ${seq}`, stream = "stdout") {
   return { seq, text, stream, ts: 1000 + seq };
 }
 
-async function boot() {
+async function boot(routes = {}) {
   const dom = new JSDOM(HTML, { runScripts: "outside-only", url: "http://localhost/" });
   const { window } = dom;
   window.EventSource = FakeEventSource;
   const fetched = [];
   window.fetch = async (url, opts = {}) => {
-    fetched.push({ url: String(url), method: opts.method || "GET" });
-    if (String(url).includes("/api/status")) {
-      return { ok: true, json: async () => statusPayload() };
+    const u = String(url);
+    fetched.push({ url: u, method: opts.method || "GET", body: opts.body });
+    if (u.startsWith("/api/reports")) {
+      const payload = routes[u] !== undefined ? routes[u] : { reports: [] };
+      return { ok: true, json: async () => payload };
     }
     return { ok: true, json: async () => statusPayload() };
   };
@@ -215,7 +217,7 @@ test("a restarted server clears stale rows and starts over", async () => {
   // New session id: old line numbers are meaningless.
   second.emit("hello", { ...statusPayload({ session_id: "epoch-b", first_seq: 7 }), cursor: 6 });
   assert.deepEqual(rowSeqs(doc), [], "stale rows from the previous server are cleared");
-  assert.match(doc.querySelector(".placeholder").textContent, /服务已重启/);
+  assert.match(doc.querySelector("#log .placeholder").textContent, /服务已重启/);
   second.emit("lines", { lines: [makeLine(7), makeLine(8)] });
   assert.deepEqual(rowSeqs(doc), [7, 8]);
   assert.equal(gapBoxes(doc).length, 0, "restart must not be reported as missing log lines");
@@ -274,6 +276,125 @@ test("start button posts and reconnects when the stream is down", async () => {
   await new Promise((r) => setTimeout(r, 20));
   assert.ok(fetched.some((f) => f.url === "/api/build/start" && f.method === "POST"));
   assert.equal(FakeEventSource.instances.length, 2);
+});
+
+/* ---------- test reports & failed-case reruns ---------- */
+
+function reportPayload(overrides = {}) {
+  return {
+    build_id: 1,
+    config: "debug",
+    verdict: "failed",
+    created_at: 1000,
+    cases: [
+      {
+        name: "test_checksum",
+        initial: { status: "pass", detail: "sha256 一致" },
+        current: { status: "pass", detail: "sha256 一致", source: "initial" },
+      },
+      {
+        name: "test_flaky_cache",
+        initial: { status: "fail", detail: "冷缓存" },
+        current: { status: "fail", detail: "冷缓存", source: "initial" },
+      },
+    ],
+    counts: { total: 2, passed: 1, failed: 1 },
+    active_rerun: null,
+    reruns: [],
+    ...overrides,
+  };
+}
+
+const tick = (ms = 10) => new Promise((r) => setTimeout(r, ms));
+
+test("reports render per-case initial and current results by build number", async () => {
+  FakeEventSource.reset();
+  const { doc } = await boot({ "/api/reports": { reports: [reportPayload()] } });
+  await tick();
+
+  const card = doc.querySelector(".report");
+  assert.ok(card, "report card rendered");
+  assert.equal(card.dataset.build, "1");
+  assert.match(card.querySelector(".report-title").textContent, /构建 #1/);
+  assert.equal(card.querySelector(".pill.failed").textContent, "failed");
+  assert.match(card.textContent, /通过 1\/2/);
+  assert.equal(card.querySelector(".rerun-start").textContent, "重跑失败用例 (1)");
+  assert.ok(!card.querySelector("table"), "case table collapsed until 详情");
+
+  card.querySelector(".report-toggle").click();
+  // renderReports rebuilds the cards; re-query the expanded one.
+  const rows = [...doc.querySelectorAll(".report table.cases tbody tr")];
+  assert.equal(rows.length, 2);
+  const flaky = rows[1];
+  assert.equal(flaky.children[0].textContent, "test_flaky_cache");
+  assert.equal(flaky.children[1].querySelector(".case-fail").textContent, "fail");
+  assert.equal(flaky.children[2].querySelector(".case-fail").textContent, "fail");
+});
+
+test("rerun button posts to the report's rerun endpoint", async () => {
+  FakeEventSource.reset();
+  const { doc, fetched } = await boot({ "/api/reports": { reports: [reportPayload()] } });
+  await tick();
+  doc.querySelector(".rerun-start").click();
+  await tick(20);
+  assert.ok(
+    fetched.some((f) => f.url === "/api/reports/1/rerun" && f.method === "POST"),
+    "POST /api/reports/1/rerun issued"
+  );
+});
+
+test("active rerun shows progress, disables start, and cancel posts", async () => {
+  FakeEventSource.reset();
+  const running = reportPayload({
+    active_rerun: { id: 1, cases: ["test_flaky_cache"], completed: [], started_at: 1000 },
+    reruns: [
+      { id: 1, status: "running", cases: ["test_flaky_cache"], completed: [], started_at: 1000, finished_at: null, exit_code: null },
+    ],
+  });
+  const { doc, fetched } = await boot({ "/api/reports": { reports: [running] } });
+  await tick();
+
+  assert.match(doc.querySelector(".rerun-state").textContent, /重跑 #1 进行中 0\/1/);
+  assert.ok(doc.querySelector(".rerun-start").disabled, "no second rerun while one runs");
+  const cancel = doc.querySelector(".rerun-cancel");
+  assert.ok(cancel, "cancel button visible during rerun");
+  cancel.click();
+  await tick(20);
+  assert.ok(
+    fetched.some((f) => f.url === "/api/reports/1/rerun/cancel" && f.method === "POST"),
+    "POST /api/reports/1/rerun/cancel issued"
+  );
+});
+
+test("interrupted rerun keeps the verdict and shows a notice", async () => {
+  FakeEventSource.reset();
+  const interrupted = reportPayload({
+    reruns: [
+      { id: 1, status: "interrupted", cases: ["test_flaky_cache"], completed: [], started_at: 1000, finished_at: 1001, exit_code: null },
+    ],
+  });
+  const { doc } = await boot({ "/api/reports": { reports: [interrupted] } });
+  await tick();
+
+  const notice = doc.querySelector(".rerun-notice");
+  assert.ok(notice, "interruption notice shown");
+  assert.match(notice.textContent, /中断/);
+  assert.match(notice.textContent, /保留此前判定/);
+  assert.equal(doc.querySelector(".pill.failed").textContent, "failed", "verdict unchanged");
+  assert.ok(!doc.querySelector(".rerun-start").disabled, "rerun can be retried");
+});
+
+test("start build sends the selected config", async () => {
+  FakeEventSource.reset();
+  const { doc, fetched } = await boot();
+  const es = FakeEventSource.latest();
+  es.emit("hello", { ...statusPayload({ status: "idle", run_id: 0 }) });
+  doc.getElementById("config").value = "release";
+  doc.getElementById("start").click();
+  await tick(20);
+  const start = fetched.find((f) => f.url === "/api/build/start" && f.method === "POST");
+  assert.ok(start, "build start posted");
+  assert.deepEqual(JSON.parse(start.body), { config: "release" });
 });
 
 (async () => {

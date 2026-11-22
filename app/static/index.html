@@ -13,6 +13,12 @@
       <span id="run-id" class="muted">未运行</span>
     </div>
     <div class="controls">
+      <label class="config-picker" for="config">配置
+        <select id="config">
+          <option value="debug" selected>debug</option>
+          <option value="release">release</option>
+        </select>
+      </label>
       <button id="start" class="primary">启动样例构建</button>
       <button id="cancel" disabled>停止</button>
       <span class="sep"></span>
@@ -30,6 +36,16 @@
     <span id="conn-pill" class="pill conn-off">未连接</span>
     <span id="meta" class="muted"></span>
     <span id="cursor" class="muted"></span>
+  </section>
+
+  <section class="reports" id="reports">
+    <div class="reports-head">
+      <h2>测试报告</h2>
+      <span class="muted">按构建号列出各用例结果；只重跑当前失败的用例，结果齐了才更新判定</span>
+    </div>
+    <div id="reports-list">
+      <div class="placeholder">尚无测试报告。完成一次构建后在此查看各用例结果。</div>
+    </div>
   </section>
 
   <main class="logwrap">

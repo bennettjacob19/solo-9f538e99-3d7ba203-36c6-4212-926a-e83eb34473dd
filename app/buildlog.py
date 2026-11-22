@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import os
 import shlex
 import sys
 import time
@@ -12,6 +13,8 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Deque, List, Optional, Sequence, Tuple
+
+from .reports import ReportManager
 
 CAPACITY = 200
 MAX_PENDING_CHARS = 16 * 1024
@@ -23,6 +26,11 @@ FAILED = "failed"
 CANCELLED = "cancelled"
 
 SAMPLE_SCRIPT = Path(__file__).with_name("sample_build.py")
+
+# The two build configurations the page offers; the sample build produces a
+# different artifact per config and the test report is tagged with it.
+CONFIGS = ("debug", "release")
+DEFAULT_CONFIG = "debug"
 
 
 class BuildBusy(RuntimeError):
@@ -162,6 +170,7 @@ class RunInfo:
     run_id: int = 0
     status: str = IDLE
     command: Optional[List[str]] = None
+    config: Optional[str] = None
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     exit_code: Optional[int] = None
@@ -179,11 +188,25 @@ class BuildRunner:
     worst fall out of the ring and be told which lines it missed.
     """
 
-    def __init__(self, capacity: int = CAPACITY, sample_cmd: Optional[Sequence[str]] = None) -> None:
+    def __init__(
+        self,
+        capacity: int = CAPACITY,
+        sample_cmd: Optional[Sequence[str]] = None,
+        report_manager: Optional[ReportManager] = None,
+        artifacts_dir: Optional[str] = None,
+    ) -> None:
         self.buffer = LogBuffer(capacity)
         self.capacity = capacity
         self.run = RunInfo()
-        self.sample_cmd = list(sample_cmd) if sample_cmd else [sys.executable, "-u", str(SAMPLE_SCRIPT)]
+        # A custom sample_cmd is a fixed command (used by tests); without one
+        # the runner drives the real sample build with --config/--build-id.
+        self._custom_cmd = list(sample_cmd) if sample_cmd else None
+        self.artifacts_dir = Path(
+            artifacts_dir or os.environ.get("BUILDLOG_ARTIFACTS_DIR") or "artifacts"
+        )
+        if report_manager is None and self._custom_cmd is None:
+            report_manager = ReportManager(self.artifacts_dir, buffer=self.buffer)
+        self.reports = report_manager
         # Line numbers are per server lifetime. A browser that reconnects
         # after a restart sends an epoch from the previous lifetime plus a
         # cursor that may be far ahead of the new buffer; the epoch lets the
@@ -198,19 +221,41 @@ class BuildRunner:
 
     # ---- lifecycle ----------------------------------------------------
 
-    async def start(self) -> None:
+    async def start(self, config: Optional[str] = None) -> None:
         async with self._lock:
             if self.running:
                 raise BuildBusy("a build is already running")
+            run_id = self.run.run_id + 1
+            if self._custom_cmd is not None:
+                command = list(self._custom_cmd)
+                run_config = None
+            else:
+                run_config = config or DEFAULT_CONFIG
+                if run_config not in CONFIGS:
+                    raise ValueError(
+                        f"unknown config {run_config!r}; choose one of {', '.join(CONFIGS)}"
+                    )
+                command = [
+                    sys.executable,
+                    "-u",
+                    str(SAMPLE_SCRIPT),
+                    "--config",
+                    run_config,
+                    "--build-id",
+                    str(run_id),
+                    "--artifacts-dir",
+                    str(self.artifacts_dir),
+                ]
             self.run = RunInfo(
-                run_id=self.run.run_id + 1,
+                run_id=run_id,
                 status=RUNNING,
-                command=list(self.sample_cmd),
+                command=command,
+                config=run_config,
                 started_at=time.time(),
             )
             self.buffer.append(
                 f"──── build #{self.run.run_id} started: "
-                + " ".join(shlex.quote(p) for p in self.sample_cmd)
+                + " ".join(shlex.quote(p) for p in command)
                 + " ────",
                 "system",
             )
@@ -228,6 +273,8 @@ class BuildRunner:
 
     async def shutdown(self) -> None:
         await self.cancel()
+        if self.reports is not None:
+            await self.reports.shutdown()
         self.buffer.close()
 
     # ---- worker -------------------------------------------------------
@@ -282,8 +329,36 @@ class BuildRunner:
         finally:
             run.finished_at = time.time()
             self._append_summary(run)
+            self._maybe_create_report(run)
             # Any waiter should re-check the finished status immediately.
             self.buffer._wake()
+
+    def _maybe_create_report(self, run: RunInfo) -> None:
+        """Turn the build's test results file into a report, if there is one.
+
+        Runs for both succeeded and failed builds: exit 1 means the build is
+        fine but some test cases failed, and that is exactly when a report
+        matters.  Cancelled builds and crashed test runners leave no complete
+        results file, so no report appears.
+        """
+        if self.reports is None or self._custom_cmd is not None:
+            return
+        if run.status not in (SUCCEEDED, FAILED):
+            return
+        try:
+            report = self.reports.create_report(run.run_id, run.config)
+        except Exception as exc:  # pragma: no cover - defensive
+            self._safe_append(f"[error] could not create test report: {exc}")
+            return
+        if report is None:
+            self._safe_append(f"──── build #{run.run_id} produced no complete test report ────")
+            return
+        total = len(report.effective)
+        failed = sum(1 for r in report.effective.values() if r["status"] != "pass")
+        self._safe_append(
+            f"──── build #{run.run_id} 测试报告已生成：判定 {report.verdict}"
+            f"（{total - failed}/{total} 通过）────"
+        )
 
     def _safe_append(self, text: str, stream: str = "system") -> None:
         try:
@@ -356,6 +431,8 @@ class BuildRunner:
             "run_id": run.run_id,
             "pid": run.pid if self.running else None,
             "command": run.command,
+            "config": run.config,
+            "configs": list(CONFIGS),
             "started_at": run.started_at,
             "finished_at": run.finished_at,
             "exit_code": run.exit_code,

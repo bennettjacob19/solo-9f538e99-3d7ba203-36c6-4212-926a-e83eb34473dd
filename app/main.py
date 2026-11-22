@@ -14,6 +14,13 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .buildlog import CAPACITY, BuildRunner, Line
+from .reports import (
+    ArtifactsMissing,
+    NoFailedCases,
+    ReportManager,
+    ReportNotFound,
+    RerunBusy,
+)
 
 STATIC_DIR = Path(__file__).with_name("static")
 HEARTBEAT_SECONDS = 15.0
@@ -52,10 +59,19 @@ def create_app(runner: Optional[BuildRunner] = None) -> FastAPI:
         return JSONResponse(get_runner().status_payload())
 
     @app.post("/api/build/start")
-    async def start_build() -> JSONResponse:
+    async def start_build(request: Request) -> JSONResponse:
         current = get_runner()
+        config = None
         try:
-            await current.start()
+            body = await request.json()
+        except Exception:  # empty or non-JSON body -> default config
+            body = None
+        if isinstance(body, dict) and body.get("config"):
+            config = str(body["config"])
+        try:
+            await current.start(config=config)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return JSONResponse(current.status_payload(), status_code=202)
@@ -65,6 +81,47 @@ def create_app(runner: Optional[BuildRunner] = None) -> FastAPI:
         current = get_runner()
         cancelled = await current.cancel()
         return JSONResponse({**current.status_payload(), "cancelled": cancelled})
+
+    def get_reports() -> ReportManager:
+        manager = get_runner().reports
+        if manager is None:
+            raise HTTPException(
+                status_code=503, detail="test reports are not enabled on this server"
+            )
+        return manager
+
+    @app.get("/api/reports")
+    async def list_reports() -> JSONResponse:
+        return JSONResponse(get_reports().list_payload())
+
+    @app.get("/api/reports/{build_id}")
+    async def get_report(build_id: int) -> JSONResponse:
+        try:
+            return JSONResponse(get_reports().payload(build_id))
+        except ReportNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/reports/{build_id}/rerun")
+    async def start_rerun(build_id: int) -> JSONResponse:
+        manager = get_reports()
+        try:
+            await manager.start_rerun(build_id)
+        except ReportNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RerunBusy as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (NoFailedCases, ArtifactsMissing) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(manager.payload(build_id), status_code=202)
+
+    @app.post("/api/reports/{build_id}/rerun/cancel")
+    async def cancel_rerun(build_id: int) -> JSONResponse:
+        manager = get_reports()
+        try:
+            cancelled = await manager.cancel_rerun(build_id)
+        except ReportNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return JSONResponse({**manager.payload(build_id), "cancelled": cancelled})
 
     def sse(event: str, data: dict, event_id: Optional[int] = None) -> str:
         payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
