@@ -1,0 +1,13 @@
+services:
+  buildlog:
+    build: .
+    image: buildlog-viewer:local
+    container_name: buildlog-viewer
+    ports:
+      - "${BUILDLOG_PORT:-8000}:8000"
+    environment:
+      # Server-side ring size. Spec requirement is the most recent 200 lines.
+      BUILDLOG_CAPACITY: "200"
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 15s

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>构建日志</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="title">
+      <h1>构建日志</h1>
+      <span id="run-id" class="muted">未运行</span>
+    </div>
+    <div class="controls">
+      <button id="start" class="primary">启动样例构建</button>
+      <button id="cancel" disabled>停止</button>
+      <span class="sep"></span>
+      <button id="disconnect" title="主动断开日志流，用于模拟掉线">模拟断线</button>
+      <button id="reconnect" title="从最后显示的日志行之后按序续读">重连</button>
+      <span class="sep"></span>
+      <label class="toggle">
+        <input type="checkbox" id="follow" checked /> 自动滚动
+      </label>
+    </div>
+  </header>
+
+  <section class="statusbar">
+    <span id="status-pill" class="pill idle">idle</span>
+    <span id="conn-pill" class="pill conn-off">未连接</span>
+    <span id="meta" class="muted"></span>
+    <span id="cursor" class="muted"></span>
+  </section>
+
+  <main class="logwrap">
+    <div id="log" class="log" role="log" aria-live="polite" aria-label="构建日志">
+      <div class="placeholder">尚无日志。点击“启动样例构建”开始。</div>
+    </div>
+    <button id="jump-bottom" class="jump-bottom" hidden>↓ 回到最新</button>
+  </main>
+
+  <footer class="footer">
+    <span>服务端仅保留最近 <strong id="capacity">200</strong> 行；无人观看时仍持续采集，断线重连会从最后显示的行之后补读。</span>
+    <span id="gap-count"></span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

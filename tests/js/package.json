@@ -1,0 +1,10 @@
+{
+  "name": "buildlog-frontend-tests",
+  "private": true,
+  "scripts": {
+    "test": "node test_frontend.js"
+  },
+  "dependencies": {
+    "jsdom": "^24.1.3"
+  }
+}
